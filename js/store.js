@@ -1,115 +1,195 @@
-import { Component } from "@/component";
-import { trigger } from "@/hooks";
-import { walkBackwards, walkUpwards } from "./utils";
-import { extractFragmentMetadataFromMarkerNode, isEndFragmentMarker, isStartFragmentMarker } from "./fragment";
+import EventAction from '@/action/event'
+import HookManager from '@/HookManager'
+import MessageBus from './MessageBus'
+import DirectiveManager from './DirectiveManager'
 
-let components = {}
+const store = {
+    componentsById: {},
+    listeners: new MessageBus(),
+    initialRenderIsFinished: false,
+    livewireIsInBackground: false,
+    livewireIsOffline: false,
+    sessionHasExpired: false,
+    sessionHasExpiredCallback: undefined,
+    directives: DirectiveManager,
+    hooks: HookManager,
+    onErrorCallback: () => { },
 
-export function initComponent(el) {
-    let component = new Component(el)
+    components() {
+        return Object.keys(this.componentsById).map(key => {
+            return this.componentsById[key]
+        })
+    },
 
-    if (components[component.id]) throw 'Component already registered'
+    addComponent(component) {
+        return (this.componentsById[component.id] = component)
+    },
 
-    let cleanup = (i) => component.addCleanup(i)
+    findComponent(id) {
+        return this.componentsById[id]
+    },
 
-    trigger('component.init', { component, cleanup })
+    getComponentsByName(name) {
+        return this.components().filter(component => {
+            return component.name === name
+        })
+    },
 
-    components[component.id] = component
+    hasComponent(id) {
+        return !!this.componentsById[id]
+    },
 
-    return component
-}
+    tearDownComponents() {
+        this.components().forEach(component => {
+            this.removeComponent(component)
+        })
+    },
 
-export function destroyComponent(id) {
-    let component = components[id]
+    on(event, callback) {
+        this.listeners.register(event, callback)
+    },
 
-    if (! component) return
+    emit(event, ...params) {
+        this.listeners.call(event, ...params)
 
-    component.cleanup()
+        this.componentsListeningForEvent(event).forEach(component =>
+            component.addAction(new EventAction(event, params))
+        )
+    },
 
-    delete components[id]
-}
+    emitUp(el, event, ...params) {
+        this.componentsListeningForEventThatAreTreeAncestors(
+            el,
+            event
+        ).forEach(component =>
+            component.addAction(new EventAction(event, params))
+        )
+    },
 
-export function hasComponent(id) {
-    return !! components[id]
-}
+    emitSelf(componentId, event, ...params) {
+        let component = this.findComponent(componentId)
 
-export function findComponent(id, strict = true) {
-    let component = components[id]
+        if (component.listeners.includes(event)) {
+            component.addAction(new EventAction(event, params))
+        }
+    },
 
-    if (! component) {
-        if (strict) throw 'Component not found: ' + id
+    emitTo(componentName, event, ...params) {
+        let components = this.getComponentsByName(componentName)
 
-        return
-    }
-
-    return component
-}
-
-export function findComponentByEl(el, strict = true) {
-    let componentId = walkUpwards(el, (node, { stop }) => {
-        if (node.__livewire) return stop(node.__livewire.id)
-
-        let endMarkers = []
-
-        let slotParentId = walkBackwards(node, (siblingNode, { stop }) => {
-            if (isEndFragmentMarker(siblingNode)) {
-                let metadata = extractFragmentMetadataFromMarkerNode(siblingNode)
-
-                if (metadata.type !== 'slot') return
-
-                endMarkers.push('a')
-
-                return
-            }
-
-            if (isStartFragmentMarker(siblingNode)) {
-                let metadata = extractFragmentMetadataFromMarkerNode(siblingNode)
-
-                if (metadata.type !== 'slot') return
-
-
-                if (endMarkers.length > 0) {
-                    endMarkers.pop()
-                } else {
-                    return stop(metadata.parent)
-                }
+        components.forEach(component => {
+            if (component.listeners.includes(event)) {
+                component.addAction(new EventAction(event, params))
             }
         })
+    },
 
-        if (slotParentId) return stop(slotParentId)
-    })
+    componentsListeningForEventThatAreTreeAncestors(el, event) {
+        var parentIds = []
 
-    let component = findComponent(componentId, strict)
+        var parent = el.parentElement.closest('[wire\\:id]')
 
-    if (! component) {
-        if (strict) throw "Could not find Livewire component in DOM tree"
+        while (parent) {
+            parentIds.push(parent.getAttribute('wire:id'))
 
-        return
+            parent = parent.parentElement.closest('[wire\\:id]')
+        }
+
+        return this.components().filter(component => {
+            return (
+                component.listeners.includes(event) &&
+                parentIds.includes(component.id)
+            )
+        })
+    },
+
+    componentsListeningForEvent(event) {
+        return this.components().filter(component => {
+            return component.listeners.includes(event)
+        })
+    },
+
+    registerDirective(name, callback) {
+        this.directives.register(name, callback)
+    },
+
+    registerHook(name, callback) {
+        this.hooks.register(name, callback)
+    },
+
+    callHook(name, ...params) {
+        this.hooks.call(name, ...params)
+    },
+
+    changeComponentId(component, newId) {
+        let oldId = component.id
+
+        component.id = newId
+        component.fingerprint.id = newId
+
+        this.componentsById[newId] = component
+
+        delete this.componentsById[oldId]
+
+        // Now go through any parents of this component and change
+        // the component's child id references.
+        this.components().forEach(component => {
+            let children = component.serverMemo.children || {}
+
+            Object.entries(children).forEach(([key, { id, tagName }]) => {
+                if (id === oldId) {
+                    children[key].id = newId
+                }
+            })
+        })
+    },
+
+    removeComponent(component) {
+        // Remove event listeners attached to the DOM.
+        component.tearDown()
+        // Remove the component from the store.
+        delete this.componentsById[component.id]
+    },
+
+    onError(callback) {
+        this.onErrorCallback = callback
+    },
+
+    getClosestParentId(childId, subsetOfParentIds) {
+        let distancesByParentId = {}
+
+        subsetOfParentIds.forEach(parentId => {
+            let distance = this.getDistanceToChild(parentId, childId)
+
+            if (distance) distancesByParentId[parentId] = distance
+        })
+
+        let smallestDistance =  Math.min(...Object.values(distancesByParentId))
+
+        let closestParentId
+
+        Object.entries(distancesByParentId).forEach(([parentId, distance]) => {
+            if (distance === smallestDistance) closestParentId = parentId
+        })
+
+        return closestParentId
+    },
+
+    getDistanceToChild(parentId, childId, distanceMemo = 1) {
+        let parentComponent = this.findComponent(parentId)
+
+        if (! parentComponent) return
+
+        let childIds = parentComponent.childIds
+
+        if (childIds.includes(childId)) return distanceMemo
+
+        for (let i = 0; i < childIds.length; i++) {
+            let distance = this.getDistanceToChild(childIds[i], childId, distanceMemo + 1)
+
+            if (distance) return distance
+        }
     }
-
-    return component
 }
 
-export function componentsByName(name) {
-    return Object.values(components).filter(component => {
-        return name == component.name
-    })
-}
-
-export function getByName(name) {
-    return componentsByName(name).map(i => i.$wire)
-}
-
-export function find(id) {
-    let component = components[id]
-
-    return component && component.$wire
-}
-
-export function first() {
-    return Object.values(components)[0].$wire
-}
-
-export function all() {
-    return Object.values(components)
-}
+export default store
